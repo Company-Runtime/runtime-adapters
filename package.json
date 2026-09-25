@@ -1,0 +1,25 @@
+{
+  "name": "runtime-adapters",
+  "private": true,
+  "description": "Official adapters that implement Runtime Protocol runtime/0.1 capabilities on concrete systems.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "pnpm -r run build",
+    "test": "node --test --test-concurrency=1 \"*/*/test/**/*.test.ts\" \"test/**/*.test.ts\"",
+    "ci": "pnpm run format:check && pnpm run typecheck && pnpm run build && pnpm test"
+  },
+  "devDependencies": {
+    "@runtime-protocol/sdk": "github:Company-Runtime/runtime-sdk#ed349679bc0b80a5d97c2b967c18a56958fff7f6",
+    "@types/node": "^22.20.4",
+    "prettier": "^3.9.9",
+    "typescript": "^5.9.3"
+  }
+}
