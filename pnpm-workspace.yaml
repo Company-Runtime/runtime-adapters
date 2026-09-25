@@ -1,0 +1,7 @@
+packages:
+  - "ai/*"
+  - "communication/*"
+  - "engineering/*"
+
+onlyBuiltDependencies:
+  - "@runtime-protocol/sdk"

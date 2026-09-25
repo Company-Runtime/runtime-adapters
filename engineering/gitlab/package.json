@@ -1,0 +1,37 @@
+{
+  "name": "@runtime-protocol/adapter-gitlab",
+  "version": "0.1.0",
+  "description": "Runtime Protocol adapter: work.create, work.assign and work.complete on GitLab issues.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Company-Runtime/runtime-adapters.git",
+    "directory": "engineering/gitlab"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepare": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@runtime-protocol/sdk": "0.1.x"
+  },
+  "devDependencies": {
+    "@runtime-protocol/sdk": "github:Company-Runtime/runtime-sdk#ed349679bc0b80a5d97c2b967c18a56958fff7f6",
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
+  }
+}
