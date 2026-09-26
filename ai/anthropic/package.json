@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Runtime Protocol adapter: reasoning.generate and reasoning.classify on the Anthropic Messages API.",
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "repository": {
     "type": "git",
