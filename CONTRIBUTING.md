@@ -9,7 +9,7 @@ express, first try a profile, a trait or a recipe; otherwise implement it under
 
 ## Checklist
 
-- [ ] Directory `<area>/<system>` (`ai`, `communication`, `engineering`, `storage`, …) and
+- [ ] Directory `<area>/<system>` (`ai`, `communication`, `engineering`, `media`, `storage`, …) and
       package `@runtime-protocol/adapter-<system>`, with the SDK as a peer dependency.
 - [ ] Built with `defineProvider`; vendor calls go through `fetchJson` (or classify
       failures the same way: never sent → `ProviderUnreachableError`, refused →
