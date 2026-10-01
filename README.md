@@ -24,13 +24,14 @@ model vendor for another changes configuration, not callers.
 
 ## Adapters
 
-| Package                               | Directory             | Capabilities                                  | Notes                                                   |
-| ------------------------------------- | --------------------- | --------------------------------------------- | ------------------------------------------------------- |
-| `@runtime-protocol/adapter-openai`    | `ai/openai`           | `reasoning.generate`, `reasoning.classify`    | Any OpenAI-compatible Chat Completions endpoint         |
-| `@runtime-protocol/adapter-anthropic` | `ai/anthropic`        | `reasoning.generate`, `reasoning.classify`    | Messages API; structured answers through a forced tool  |
-| `@runtime-protocol/adapter-slack`     | `communication/slack` | `communication.send` (`chat`)                 | Reconciles uncertain deliveries from message metadata   |
-| `@runtime-protocol/adapter-github`    | `engineering/github`  | `work.create`, `work.assign`, `work.complete` | Issues; reconciles from an idempotency marker and state |
-| `@runtime-protocol/adapter-gitlab`    | `engineering/gitlab`  | `work.create`, `work.assign`, `work.complete` | Issues; reconciles from an idempotency marker and state |
+| Package                               | Directory             | Capabilities                                                                                       | Notes                                                     |
+| ------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `@runtime-protocol/adapter-openai`    | `ai/openai`           | `reasoning.generate`, `reasoning.classify`                                                         | Any OpenAI-compatible Chat Completions endpoint           |
+| `@runtime-protocol/adapter-anthropic` | `ai/anthropic`        | `reasoning.generate`, `reasoning.classify`                                                         | Messages API; structured answers through a forced tool    |
+| `@runtime-protocol/adapter-slack`     | `communication/slack` | `communication.send` (`chat`)                                                                      | Reconciles uncertain deliveries from message metadata     |
+| `@runtime-protocol/adapter-github`    | `engineering/github`  | `work.create`, `work.assign`, `work.complete`                                                      | Issues; reconciles from an idempotency marker and state   |
+| `@runtime-protocol/adapter-gitlab`    | `engineering/gitlab`  | `work.create`, `work.assign`, `work.complete`                                                      | Issues; reconciles from an idempotency marker and state   |
+| `@runtime-protocol/adapter-youtube`   | `media/youtube`       | `communication.publish` (`broadcast`, `chat`), `resource.read`/`search`/`create`/`update`/`delete` | Resumable uploads; reconciles from a marker tag and state |
 
 Each adapter's README lists its profiles, traits, credentials, evidence and failure
 mapping.
