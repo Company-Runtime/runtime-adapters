@@ -24,9 +24,16 @@ export const SEED = {
 export const ref = {
   video: (id: string) => `${CHANNEL_REF}/videos/${id}`,
   thumbnail: (id: string) => `${CHANNEL_REF}/videos/${id}/thumbnail`,
-  comment: (id: string) => `${CHANNEL_REF}/comments/${id}`,
+  comment: (video: string, id: string) => `${CHANNEL_REF}/videos/${video}/comments/${id}`,
   playlist: (id: string) => `${CHANNEL_REF}/playlists/${id}`,
   item: (playlist: string, id: string) => `${CHANNEL_REF}/playlists/${playlist}/items/${id}`,
+};
+
+/** Another channel's video, with a viewer's comment: out of the adapter's reach. */
+export const FOREIGN = {
+  channel: "UCsomeoneelse",
+  video: "otherVideo1",
+  comment: "UgOtherComment",
 };
 
 /** A 600 KiB clip: three chunks of 256 KiB. */
@@ -54,7 +61,12 @@ const notFound = (what: string) => error(404, `${what}NotFound`, `The ${what} wa
 
 /** A YouTube channel with the Data API, resumable uploads, Google OAuth and a media host. */
 export function youtube(
-  options: { delayMs?: number; override?: (request: FakeRequest) => Override | undefined } = {},
+  options: {
+    delayMs?: number;
+    override?: (request: FakeRequest) => Override | undefined;
+    /** The channel the access token manages; defaults to CHANNEL. */
+    mine?: string;
+  } = {},
 ) {
   const videos = new Map<string, Item>();
   const uploads: string[] = [];
@@ -166,6 +178,31 @@ export function youtube(
     contentDetails: { duration: "PT4M13S" },
   });
   uploads.push(SEED.video);
+  videos.set(FOREIGN.video, {
+    id: FOREIGN.video,
+    snippet: {
+      channelId: FOREIGN.channel,
+      title: "Someone else's video",
+      description: "",
+      categoryId: "22",
+      publishedAt: "2026-01-01T00:00:00Z",
+    },
+    status: { privacyStatus: "public", uploadStatus: "processed" },
+  });
+  comments.set(
+    FOREIGN.comment,
+    comment(
+      {
+        id: FOREIGN.comment,
+        snippet: {
+          videoId: FOREIGN.video,
+          textOriginal: "Hi",
+          publishedAt: "2026-01-02T00:00:00Z",
+        },
+      },
+      "UCviewer",
+    ),
+  );
   comments.set(
     SEED.comment,
     comment(
@@ -213,25 +250,27 @@ export function youtube(
       respond((r) => ({
         body: {
           items:
-            query(r, "id") === CHANNEL
-              ? [
-                  {
-                    id: CHANNEL,
-                    snippet: {
-                      title: "Creator",
-                      description: "Videos.",
-                      customUrl: "@creator",
-                      publishedAt: "2020-01-01T00:00:00Z",
+            query(r, "mine") === "true"
+              ? [{ id: options.mine ?? CHANNEL }]
+              : query(r, "id") === CHANNEL
+                ? [
+                    {
+                      id: CHANNEL,
+                      snippet: {
+                        title: "Creator",
+                        description: "Videos.",
+                        customUrl: "@creator",
+                        publishedAt: "2020-01-01T00:00:00Z",
+                      },
+                      statistics: {
+                        subscriberCount: "1200",
+                        viewCount: "50000",
+                        videoCount: String(videos.size),
+                      },
+                      contentDetails: { relatedPlaylists: { uploads: UPLOADS } },
                     },
-                    statistics: {
-                      subscriberCount: "1200",
-                      viewCount: "50000",
-                      videoCount: String(videos.size),
-                    },
-                    contentDetails: { relatedPlaylists: { uploads: UPLOADS } },
-                  },
-                ]
-              : [],
+                  ]
+                : [],
         },
       })),
     ],
@@ -459,6 +498,15 @@ export function youtube(
       "GET",
       "/youtube/v3/commentThreads",
       respond((r) => {
+        if (query(r, "id"))
+          return {
+            body: {
+              items: byIds(r, comments)
+                .filter((c) => !c["snippet"]["parentId"])
+                .filter((c) => c["snippet"]["moderationStatus"] === "published")
+                .map(thread),
+            },
+          };
         const videoId = query(r, "videoId");
         if (!videos.has(videoId ?? "")) return notFound("video");
         const moderation = query(r, "moderationStatus") ?? "published";
@@ -589,6 +637,25 @@ export function youtube(
   const media = fakeApi(MEDIA, [
     ["GET", "/clip.mp4", () => ({ raw: CLIP, headers: { "content-length": String(CLIP.length) } })],
     ["GET", "/thumb.png", () => ({ raw: PNG, headers: { "content-length": String(PNG.length) } })],
+    ["GET", "/moved.png", () => ({ status: 302, raw: null, headers: { location: "/thumb.png" } })],
+    [
+      "GET",
+      "/to-http.png",
+      () => ({
+        status: 302,
+        raw: null,
+        headers: { location: "http://media.example.com/thumb.png" },
+      }),
+    ],
+    [
+      "GET",
+      "/to-elsewhere.png",
+      () => ({
+        status: 302,
+        raw: null,
+        headers: { location: "https://internal.example.net/x.png" },
+      }),
+    ],
   ]);
 
   const hosts: Array<[string, typeof api]> = [

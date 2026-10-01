@@ -7,22 +7,23 @@ export type Ref =
   | { kind: "thumbnail"; channel: string; id: string }
   | { kind: "playlist"; channel: string; id: string }
   | { kind: "playlist_item"; channel: string; playlist: string; id: string }
-  | { kind: "comment"; channel: string; id: string };
+  | { kind: "comment"; channel: string; video: string; id: string };
 
 export type Kind = Ref["kind"];
 
 const ID = "[A-Za-z0-9_.=-]+";
 const PATTERN = new RegExp(
-  `^resource://youtube/(${ID})(?:/(videos|playlists|comments)/(${ID})(?:/(thumbnail|items/(${ID})))?)?$`,
+  `^resource://youtube/(${ID})(?:/(videos|playlists)/(${ID})(?:/(thumbnail|items/(${ID})|comments/(${ID})))?)?$`,
 );
 
 /** Parses a reference; undefined when it is not a YouTube reference this adapter knows. */
 export function parseRef(ref: unknown): Ref | undefined {
   const match = typeof ref === "string" ? PATTERN.exec(ref) : null;
   if (!match) return undefined;
-  const [, channel, collection, id, tail, item] = match as unknown as [
+  const [, channel, collection, id, tail, item, comment] = match as unknown as [
     string,
     string,
+    string?,
     string?,
     string?,
     string?,
@@ -34,7 +35,8 @@ export function parseRef(ref: unknown): Ref | undefined {
   if (collection === "playlists" && !tail) return { kind: "playlist", channel, id };
   if (collection === "playlists" && item)
     return { kind: "playlist_item", channel, playlist: id, id: item };
-  if (collection === "comments" && !tail) return { kind: "comment", channel, id };
+  if (collection === "videos" && comment)
+    return { kind: "comment", channel, video: id, id: comment };
   return undefined;
 }
 
@@ -52,7 +54,7 @@ export function refOf(ref: Ref): string {
     case "playlist_item":
       return `${base}/playlists/${ref.playlist}/items/${ref.id}`;
     case "comment":
-      return `${base}/comments/${ref.id}`;
+      return `${base}/videos/${ref.video}/comments/${ref.id}`;
   }
 }
 

@@ -318,17 +318,31 @@ try {
 
     // --- Comments ---------------------------------------------------------------------
     const commented = commentVideo ? `${CHANNEL_REF}/videos/${commentVideo}` : video;
-    const commentInput = { audience: commented, content: `Smoke comment ${stamp}` };
+    // A comment is a message in the video's thread.
+    const commentInput = {
+      audience: commented,
+      thread: commented,
+      content: `Smoke comment ${stamp}`,
+    };
     const comment = await step(
       `comment on ${commentVideo ? "the comment video" : "the upload"}`,
-      () => execute({ capability: "communication.publish", profile: "chat", input: commentInput }),
+      () =>
+        execute({
+          capability: "communication.publish",
+          profile: "chat",
+          traits: ["threading"],
+          input: commentInput,
+        }),
     );
     const commentRef = refIn(comment, "publication");
     if (comment && commentRef) {
       created.push(commentRef);
       await step("reconcile the comment by author, text and time", () =>
         reconciled("comment", commentRef, () =>
-          reconcile("communication.publish", commentInput, comment.key, { profile: "chat" }),
+          reconcile("communication.publish", commentInput, comment.key, {
+            profile: "chat",
+            traits: ["threading"],
+          }),
         ),
       );
       const reply = await step("reply to the comment", () =>
@@ -408,8 +422,8 @@ try {
     const deleted = await step(`delete ${ref.replace(CHANNEL_REF, "")}`, () =>
       execute({ capability: "resource.delete", input: { resource: ref }, settle: true }),
     );
-    if (deleted && ref.includes("/videos/"))
-      await step("reconcile the video deletion", () =>
+    if (deleted && /\/videos\/[^/]+(\/comments\/[^/]+)?$/.test(ref))
+      await step("reconcile the deletion", () =>
         reconciled("delete", ref, () =>
           reconcile("resource.delete", { resource: ref }, deleted.key),
         ),

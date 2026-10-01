@@ -95,20 +95,16 @@ function stateOf(kind: Kind, resource: Record<string, any>): Json | undefined {
 }
 
 /** Reads one resource; refuses what does not exist or belongs to another channel. */
-async function load(
+export async function load(
   ctx: HandlerContext,
   deps: Deps,
   ref: Ref,
   part = PARTS[ref.kind],
 ): Promise<Record<string, any>> {
+  if (ref.kind === "comment") return ownComment(ctx, deps, ref, part);
   const id = ref.kind === "channel" ? ref.channel : ref.id;
   const found = await fetchOne(ctx, deps, COLLECTION[ref.kind], id, part);
-  if (!found)
-    throw new ProviderFailure(
-      ref.kind === "comment"
-        ? "the YouTube comment does not exist or is not public (held or rejected)"
-        : `the YouTube ${NAMES[ref.kind]} does not exist`,
-    );
+  if (!found) throw new ProviderFailure(`the YouTube ${NAMES[ref.kind]} does not exist`);
   const owner = found["snippet"]?.["channelId"];
   if (
     ["video", "thumbnail", "playlist", "playlist_item"].includes(ref.kind) &&
@@ -120,6 +116,77 @@ async function load(
     throw new ProviderFailure("the YouTube playlist item is not in that playlist");
   return found;
 }
+
+type CommentRef = Extract<Ref, { kind: "comment" }>;
+const NOT_PUBLIC = "the YouTube comment does not exist or is not public (held or rejected)";
+
+/**
+ * Reads a comment that is provably within the channel: its video belongs to the channel,
+ * and its thread is on that video. A reference only names them; YouTube lets anyone
+ * comment anywhere, so the names are checked before anything is done with the comment.
+ */
+async function ownComment(
+  ctx: HandlerContext,
+  deps: Deps,
+  ref: CommentRef,
+  part = "snippet",
+): Promise<Record<string, any>> {
+  await load(ctx, deps, { kind: "video", channel: ref.channel, id: ref.video }, "snippet");
+  const thread = await fetchOne(ctx, deps, "commentThreads", ref.id.split(".")[0]!, "snippet");
+  if (!thread) throw new ProviderFailure(NOT_PUBLIC);
+  if (thread["snippet"]?.["videoId"] !== ref.video)
+    throw new ProviderFailure("the YouTube comment is not on that video");
+  if (!ref.id.includes(".")) return record(thread["snippet"]?.["topLevelComment"]);
+  const reply = await fetchOne(ctx, deps, "comments", ref.id, part);
+  if (!reply) throw new ProviderFailure(NOT_PUBLIC);
+  return reply;
+}
+
+/** Where a comment stands, as far as YouTube shows it to the channel owner. */
+interface Moderation {
+  /** Readable by anyone: published. */
+  public: boolean;
+  /** Listed as held for review. */
+  held: boolean;
+  /** Listed as held for review or as likely spam: awaiting a decision. */
+  pending: boolean;
+}
+
+/**
+ * Observes a top-level comment's moderation: whether it is public, and whether it is in its
+ * video's held or likely-spam lists. YouTube never reports a status directly, and lists
+ * only top-level comments, so replies (and lists too long to read) cannot be observed.
+ */
+async function moderationOf(
+  ctx: HandlerContext,
+  deps: Deps,
+  ref: CommentRef,
+): Promise<Moderation | undefined> {
+  if (ref.id.includes(".")) return undefined;
+  const listed = async (moderationStatus: string) => {
+    const threads = await fetchAll(ctx, deps, `${V3}/commentThreads`, {
+      part: "id",
+      videoId: ref.video,
+      moderationStatus,
+    });
+    return threads && threads.some((t) => t["id"] === ref.id);
+  };
+  const isPublic = !!(await fetchOne(ctx, deps, "comments", ref.id, "id"));
+  const held = await listed("heldForReview");
+  const spam = await listed("likelySpam");
+  if (held === undefined || spam === undefined) return undefined;
+  return { public: isPublic, held, pending: held || spam };
+}
+
+/** Whether what YouTube shows proves the requested moderation. */
+const moderated = (target: string, m: Moderation) =>
+  target === "published"
+    ? m.public
+    : target === "held_for_review"
+      ? m.held && !m.public
+      : !m.public && !m.pending;
+
+const moderationState = (m: Moderation): Json => ({ public: m.public, awaiting_review: m.pending });
 
 function checkVersion(kind: Kind, resource: Record<string, any>, expected: unknown): void {
   if (expected === undefined) return;
@@ -135,7 +202,8 @@ const refs = (deps: Deps) => ({
   video: (id: string) => refOf({ kind: "video", channel: deps.channel, id }),
   thumbnail: (id: string) => refOf({ kind: "thumbnail", channel: deps.channel, id }),
   playlist: (id: string) => refOf({ kind: "playlist", channel: deps.channel, id }),
-  comment: (id: string) => refOf({ kind: "comment", channel: deps.channel, id }),
+  comment: (video: string, id: string) =>
+    refOf({ kind: "comment", channel: deps.channel, video, id }),
   item: (playlist: string, id: string) =>
     refOf({ kind: "playlist_item", channel: deps.channel, playlist, id }),
 });
@@ -176,7 +244,7 @@ export async function read(input: Json, ctx: HandlerContext, deps: Deps) {
       content = itemView(found, (id) => refOf({ kind: "video", channel: deps.channel, id }));
       break;
     case "comment":
-      content = commentView(found, r.comment);
+      content = commentView(found, (id) => r.comment(ref.video, id));
       break;
   }
   const fields = input["fields"] as string[] | undefined;
@@ -299,6 +367,7 @@ export async function search(input: Json, ctx: HandlerContext, deps: Deps) {
       );
       if (query !== undefined) throw new ProviderFailure("YouTube cannot search replies by text");
       const parent = resolve(deps.channel, filters["parent"], ["comment"], "filters.parent");
+      await ownComment(ctx, deps, parent);
       const { body } = await call("comments", {
         part: "snippet",
         parentId: parent.id,
@@ -306,14 +375,16 @@ export async function search(input: Json, ctx: HandlerContext, deps: Deps) {
       });
       items = (body?.items ?? []).map((c) =>
         hit(
-          r.comment(c.id),
+          r.comment(parent.video, c.id),
           "comment",
           undefined,
           c.snippet?.textOriginal ?? c.snippet?.textDisplay,
         ),
       );
+      next = body?.nextPageToken;
     } else {
       const video = resolve(deps.channel, filters["video"], ["video"], "filters.video");
+      await load(ctx, deps, video, "snippet");
       if (
         moderation !== undefined &&
         !["published", "held_for_review", "likely_spam"].includes(String(moderation))
@@ -336,14 +407,14 @@ export async function search(input: Json, ctx: HandlerContext, deps: Deps) {
       items = (body?.items ?? []).map((t) => {
         const top = t.snippet?.topLevelComment;
         return hit(
-          r.comment(top?.id),
+          r.comment(video.id, top?.id),
           "comment",
           undefined,
           top?.snippet?.textOriginal ?? top?.snippet?.textDisplay,
         );
       });
+      next = body?.nextPageToken;
     }
-    next = undefined;
   }
   return {
     output: { items, ...(next ? { next_cursor: next } : {}) },
@@ -506,18 +577,12 @@ export const reconcileCreate = (input: Json, ctx: HandlerContext, deps: Deps): P
 // resource.update: metadata, thumbnails and comment moderation
 
 const ITEM_FIELDS = ["position"];
-const COMMENT_FIELDS = ["text", "moderation_status", "ban_author"];
+const COMMENT_FIELDS = ["text", "moderation_status"];
 
 type UpdatePlan =
   | { kind: "video" | "playlist"; ref: Ref & { id: string }; patch: Record<string, unknown> }
   | { kind: "playlist_item"; ref: Extract<Ref, { kind: "playlist_item" }>; position: number }
-  | {
-      kind: "comment";
-      ref: Ref & { id: string };
-      text?: string;
-      moderation?: string;
-      banAuthor?: boolean;
-    }
+  | { kind: "comment"; ref: CommentRef; text?: string; moderation?: string }
   | { kind: "thumbnail"; ref: Ref & { id: string }; uri: string; mediaType: string };
 
 function planUpdate(input: Json, deps: Deps): UpdatePlan {
@@ -566,7 +631,7 @@ function planUpdate(input: Json, deps: Deps): UpdatePlan {
           throw new ProviderFailure(
             `${name} is not an editable field of a YouTube comment (${COMMENT_FIELDS.join(", ")})`,
           );
-      const { text, moderation_status: moderation, ban_author: banAuthor } = fields;
+      const { text, moderation_status: moderation } = fields;
       if (
         text !== undefined &&
         !(typeof text === "string" && text.length > 0 && text.length <= 10_000)
@@ -579,16 +644,11 @@ function planUpdate(input: Json, deps: Deps): UpdatePlan {
         throw new ProviderFailure(
           "moderation_status must be published, held_for_review or rejected",
         );
-      if (banAuthor !== undefined && !(typeof banAuthor === "boolean" && moderation === "rejected"))
-        throw new ProviderFailure(
-          "ban_author is a boolean that applies only with moderation_status rejected",
-        );
       return {
         kind: "comment",
         ref,
         ...(text !== undefined ? { text: text as string } : {}),
         ...(moderation !== undefined ? { moderation: moderation as string } : {}),
-        ...(banAuthor !== undefined ? { banAuthor: banAuthor as boolean } : {}),
       };
     }
     case "thumbnail": {
@@ -632,10 +692,12 @@ function updated(ctx: HandlerContext, plan: UpdatePlan, state: Json | undefined)
 export async function update(input: Json, ctx: HandlerContext, deps: Deps) {
   const plan = planUpdate(input, deps);
   const ref = refOf(plan.ref);
-  // YouTube cannot read held or rejected comments back, so moderation goes straight to
-  // the moderation call unless a version must be checked first.
+  // YouTube cannot read held or rejected comments, so moderation checks only that the video
+  // is the channel's (only its owner may moderate) unless a version must be checked first.
   const blind =
     plan.kind === "comment" && plan.text === undefined && input["expected_version"] === undefined;
+  if (blind)
+    await load(ctx, deps, { kind: "video", channel: deps.channel, id: plan.ref.video }, "snippet");
   const current = blind ? {} : await load(ctx, deps, plan.ref, WRITE_PARTS[plan.kind]);
   if (!blind) checkVersion(plan.kind, current, input["expected_version"]);
   let answer: Record<string, any> | undefined;
@@ -684,28 +746,26 @@ export async function update(input: Json, ctx: HandlerContext, deps: Deps) {
         await deps.client.call(ctx, {
           method: "POST",
           path: `${V3}/comments/setModerationStatus`,
-          query: {
-            id: plan.ref.id,
-            moderationStatus: MODERATION_TO_YOUTUBE[plan.moderation],
-            ...(plan.banAuthor !== undefined ? { banAuthor: plan.banAuthor } : {}),
-          },
+          query: { id: plan.ref.id, moderationStatus: MODERATION_TO_YOUTUBE[plan.moderation] },
         });
-        // Only published comments can be read back, so what YouTube shows is whether the
-        // comment is public; that takes a moment to change, and is observed only once it has.
-        const expected = plan.moderation === "published";
-        observed = false;
-        for (let attempt = 0; attempt < READ_BACK_TRIES && !observed; attempt++) {
+        // Moderation takes a moment to show, and is observed only once it has.
+        let seen: Moderation | undefined;
+        for (let attempt = 0; attempt < READ_BACK_TRIES && !seen; attempt++) {
           try {
             if (attempt > 0) await sleep(READ_BACK_PAUSE_MS, undefined, { signal: ctx.signal });
-            answer = await fetchOne(ctx, deps, "comments", plan.ref.id, "snippet");
+            const m = await moderationOf(ctx, deps, plan.ref);
+            if (!m) break;
+            if (moderated(plan.moderation, m)) seen = m;
           } catch {
             break; // The moderation was confirmed; a failed read back only costs the observation.
           }
-          observed = !!answer === expected;
         }
-        if (!expected) answer = undefined;
-      }
-      state = answer ? { ...(commentState(answer) as Json), public: true } : { public: false };
+        observed = !!seen;
+        state = {
+          ...(answer ? (commentState(answer) as Json) : {}),
+          ...(seen ? moderationState(seen) : {}),
+        };
+      } else state = commentState(answer);
       break;
     }
     case "thumbnail": {
@@ -774,12 +834,24 @@ export const reconcileUpdate = (input: Json, ctx: HandlerContext, deps: Deps): P
       state = current && itemState(current);
       done = state?.["position"] === plan.position;
     } else {
-      // YouTube shows no moderation status: a published comment is public, a held or
-      // rejected one is not.
-      state = current ? { ...(commentState(current) as Json), public: true } : { public: false };
+      const textDone = plan.text === undefined || commentState(current)["text"] === plan.text;
+      let moderation: Moderation | undefined;
+      if (plan.moderation !== undefined) {
+        moderation = await moderationOf(ctx, deps, plan.ref);
+        if (!moderation)
+          return {
+            status: "inconclusive",
+            reason: "YouTube does not show the moderation of replies, or of this many comments",
+          };
+      }
+      state = {
+        ...(current ? (commentState(current) as Json) : {}),
+        ...(moderation ? moderationState(moderation) : {}),
+      };
       done =
-        (plan.text === undefined || state["text"] === plan.text) &&
-        (plan.moderation === undefined || state["public"] === (plan.moderation === "published"));
+        (current !== undefined || plan.text === undefined) &&
+        textDone &&
+        (plan.moderation === undefined || moderated(plan.moderation, moderation!));
     }
     if (done && state)
       return {
@@ -809,7 +881,7 @@ export async function remove(input: Json, ctx: HandlerContext, deps: Deps) {
   const ref = refOf(target);
   if (input["expected_version"] !== undefined)
     checkVersion(target.kind, await load(ctx, deps, target), input["expected_version"]);
-  else if (target.kind !== "comment") await load(ctx, deps, target, "snippet");
+  else await load(ctx, deps, target, "snippet");
   const { status } = await deps.client.call(ctx, {
     method: "DELETE",
     path: `${V3}/${COLLECTION[target.kind]}`,

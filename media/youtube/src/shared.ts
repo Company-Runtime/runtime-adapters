@@ -75,13 +75,19 @@ export const record = (value: unknown): Record<string, any> =>
 export async function fetchOne(
   ctx: HandlerContext,
   deps: Deps,
-  collection: "videos" | "playlists" | "playlistItems" | "comments" | "channels",
+  collection: "videos" | "playlists" | "playlistItems" | "comments" | "commentThreads" | "channels",
   id: string,
   part: string,
 ): Promise<Record<string, any> | undefined> {
   const { body } = await deps.client.call<{ items?: unknown[] }>(ctx, {
     path: `/youtube/v3/${collection}`,
-    query: { id, part, ...(collection === "comments" ? { textFormat: "plainText" } : {}) },
+    query: {
+      id,
+      part,
+      ...(collection === "comments" || collection === "commentThreads"
+        ? { textFormat: "plainText" }
+        : {}),
+    },
   });
   const item = body?.items?.[0];
   return item === undefined ? undefined : record(item);

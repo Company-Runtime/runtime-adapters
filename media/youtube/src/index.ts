@@ -35,8 +35,13 @@ export interface YouTubeProviderOptions {
   baseUrl?: string;
   /** Where OAuth grants are exchanged; defaults to https://oauth2.googleapis.com/token. */
   tokenUrl?: string;
-  /** Opens attachment URIs for uploads and thumbnails; defaults to plain `https:` downloads. */
+  /**
+   * Opens attachment URIs for uploads and thumbnails. Without it, attachments are
+   * downloaded over `https:` from `attachmentHosts` only.
+   */
   openAttachment?: OpenAttachment;
+  /** Hosts the default opener may download attachments from (every redirect hop included). */
+  attachmentHosts?: string[];
   /** Upload chunk size, a multiple of 256 KiB; defaults to 8 MiB. */
   chunkSize?: number;
   /** Privacy of uploads and playlists that do not set one; defaults to `private`. */
@@ -70,6 +75,7 @@ export function createYouTubeProvider(options: YouTubeProviderOptions): Provider
     client: createClient({
       baseUrl: (options.baseUrl ?? "https://www.googleapis.com").replace(/\/+$/, ""),
       tokenUrl: options.tokenUrl ?? "https://oauth2.googleapis.com/token",
+      channel: options.channel,
       ...(options.fetch ? { fetch: options.fetch } : {}),
     }),
     channel: options.channel,
@@ -77,7 +83,7 @@ export function createYouTubeProvider(options: YouTubeProviderOptions): Provider
     chunkSize,
     defaultPrivacy: options.defaultPrivacy ?? "private",
     defaultCategory: options.defaultCategory ?? "22",
-    open: options.openAttachment ?? httpsAttachments(options.fetch),
+    open: options.openAttachment ?? httpsAttachments(options.attachmentHosts ?? [], options.fetch),
   };
 
   /**

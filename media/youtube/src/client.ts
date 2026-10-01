@@ -109,6 +109,8 @@ function detailOf(body: unknown): { reason?: string; message?: string } {
 export function createClient(options: {
   baseUrl: string;
   tokenUrl: string;
+  /** The channel the credential must manage; checked once per invocation. */
+  channel: string;
   fetch?: typeof fetch;
 }): Client {
   const origin = new URL(options.baseUrl).origin;
@@ -191,76 +193,108 @@ export function createClient(options: {
         { code: "credential_unavailable" },
       );
     // Nothing has reached YouTube yet, whatever happened to the exchange.
-    throw new ProviderFailure(`${api} answered HTTP ${response.status}`, {
-      code: "provider_unavailable",
-      retryable: true,
-    });
+    throw new ProviderFailure(`${api} answered HTTP ${response.status}`, { retryable: true });
   };
 
+  const authorize = async (ctx: HandlerContext): Promise<Session> => {
+    const value = await ctx.credential();
+    if (!value) return { secrets: [] };
+    const grant = grantOf(value);
+    if (!grant) return { token: value, secrets: [value] };
+    try {
+      return await exchange(ctx, value, grant);
+    } catch (error) {
+      if (error instanceof ProviderUnreachableError || error instanceof ProviderFailure)
+        throw error;
+      if (ctx.signal.aborted) throw error;
+      throw new ProviderFailure("the YouTube OAuth grant could not be exchanged", {
+        retryable: true,
+      });
+    }
+  };
+
+  /**
+   * The invocation's session: a token for a credential that manages the configured
+   * channel. Effects through another channel's credential would land on that channel while
+   * references and reconciliation name this one.
+   */
   const session = (ctx: HandlerContext): Promise<Session> => {
     let current = sessions.get(ctx);
     if (!current) {
       current = (async () => {
-        const value = await ctx.credential();
-        if (!value) return { secrets: [] };
-        const grant = grantOf(value);
-        if (!grant) return { token: value, secrets: [value] };
+        const authorized = await authorize(ctx);
+        let mine: Answer<{ items?: Array<{ id?: unknown }> } | null>;
         try {
-          return await exchange(ctx, value, grant);
+          mine = await request(ctx, authorized, {
+            path: "/youtube/v3/channels",
+            query: { part: "id", mine: true },
+          });
         } catch (error) {
-          if (error instanceof ProviderUnreachableError || error instanceof ProviderFailure)
-            throw error;
-          if (ctx.signal.aborted) throw error;
-          throw new ProviderFailure("the YouTube OAuth grant could not be exchanged", {
-            code: "provider_unavailable",
+          if (ctx.signal.aborted || error instanceof ProviderFailure) throw error;
+          if (error instanceof ProviderUnreachableError) throw error;
+          // A read that went wrong had no effect.
+          throw new ProviderFailure("the channel of the YouTube credential could not be read", {
             retryable: true,
           });
         }
+        if (mine.body?.items?.[0]?.id !== options.channel)
+          throw new ProviderFailure(
+            "the YouTube credential does not manage the configured channel",
+            {
+              code: "credential_unavailable",
+            },
+          );
+        return authorized;
       })();
       sessions.set(ctx, current);
     }
     return current;
   };
 
+  const request = async <T>(
+    ctx: HandlerContext,
+    { token, secrets }: Session,
+    call: Call,
+  ): Promise<Answer<T>> => {
+    const url = new URL(call.path, origin);
+    if (url.origin !== origin) throw new ProviderFailure(`${API} pointed outside its origin`);
+    for (const [key, value] of Object.entries(call.query ?? {}))
+      if (value !== undefined) url.searchParams.set(key, String(value));
+    const headers: Record<string, string> = {
+      accept: "application/json",
+      ...(call.json !== undefined ? { "content-type": "application/json" } : {}),
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...call.headers,
+    };
+    const body =
+      call.json !== undefined
+        ? JSON.stringify(call.json)
+        : call.bytes !== undefined
+          ? (call.bytes as BodyInit)
+          : undefined;
+    const response = await send(
+      ctx,
+      url,
+      {
+        method: call.method ?? (body !== undefined ? "POST" : "GET"),
+        headers,
+        ...(body !== undefined ? { body } : {}),
+      },
+      API,
+    );
+    const answer = await read(response, API);
+    const status = response.status;
+    if ((status >= 200 && status < 300) || call.accept?.includes(status)) {
+      if (!answer.json)
+        throw new Error(`${API} answered HTTP ${status} with a body that is not JSON`);
+      return { status, headers: response.headers, body: answer.body as T };
+    }
+    return refuse(status, answer.json ? answer.body : null, API, secrets);
+  };
+
   return {
     origin,
     secrets: async (ctx) => (await session(ctx)).secrets,
-    async call<T>(ctx: HandlerContext, call: Call): Promise<Answer<T>> {
-      const { token, secrets } = await session(ctx);
-      const url = new URL(call.path, origin);
-      if (url.origin !== origin) throw new ProviderFailure(`${API} pointed outside its origin`);
-      for (const [key, value] of Object.entries(call.query ?? {}))
-        if (value !== undefined) url.searchParams.set(key, String(value));
-      const headers: Record<string, string> = {
-        accept: "application/json",
-        ...(call.json !== undefined ? { "content-type": "application/json" } : {}),
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-        ...call.headers,
-      };
-      const body =
-        call.json !== undefined
-          ? JSON.stringify(call.json)
-          : call.bytes !== undefined
-            ? (call.bytes as BodyInit)
-            : undefined;
-      const response = await send(
-        ctx,
-        url,
-        {
-          method: call.method ?? (body !== undefined ? "POST" : "GET"),
-          headers,
-          ...(body !== undefined ? { body } : {}),
-        },
-        API,
-      );
-      const answer = await read(response, API);
-      const status = response.status;
-      if ((status >= 200 && status < 300) || call.accept?.includes(status)) {
-        if (!answer.json)
-          throw new Error(`${API} answered HTTP ${status} with a body that is not JSON`);
-        return { status, headers: response.headers, body: answer.body as T };
-      }
-      return refuse(status, answer.json ? answer.body : null, API, secrets);
-    },
+    call: async <T>(ctx: HandlerContext, call: Call) => request<T>(ctx, await session(ctx), call),
   };
 }

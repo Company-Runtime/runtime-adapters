@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import { verifyReceipt, type Json } from "@runtime-protocol/sdk";
 import { runProviderHarness } from "@runtime-protocol/sdk/conformance";
 import { createYouTubeProvider, type YouTubeProviderOptions } from "../src/index.ts";
+import type { Invocation } from "@runtime-protocol/sdk";
 import { AGENT, runtimeFor } from "../../../testing/runtime.ts";
 import {
   CHANNEL,
   CHANNEL_REF,
   CLIP,
   CLIP_DIGEST,
+  FOREIGN,
   GRANT,
   GRANT_KEY,
   KEY,
@@ -91,7 +93,12 @@ test("the YouTube adapter meets every provider requirement", async () => {
     {
       capability: "communication.publish",
       profile: "chat",
-      input: { audience: ref.video(SEED.video), content: "Thanks for watching!" },
+      traits: ["threading"],
+      input: {
+        audience: ref.video(SEED.video),
+        thread: ref.video(SEED.video),
+        content: "Thanks for watching!",
+      },
       ...mutating,
     },
     {
@@ -100,7 +107,7 @@ test("the YouTube adapter meets every provider requirement", async () => {
       traits: ["threading"],
       input: {
         audience: ref.video(SEED.video),
-        thread: ref.comment(SEED.comment),
+        thread: ref.comment(SEED.video, SEED.comment),
         content: "Glad you liked it.",
       },
       ...mutating,
@@ -126,7 +133,7 @@ test("the YouTube adapter meets every provider requirement", async () => {
     {
       capability: "resource.update",
       input: {
-        resource: ref.comment(SEED.comment),
+        resource: ref.comment(SEED.video, SEED.comment),
         patch: { moderation_status: "held_for_review" },
       },
       ...mutating,
@@ -262,12 +269,18 @@ test("comments, replies, edits and moderation", async () => {
   const posted = await runtime.execute({
     capability: "communication.publish",
     profile: "chat",
+    traits: ["threading"],
     actor: AGENT,
-    input: { audience: ref.video(SEED.video), content: "New video on Friday." },
+    input: {
+      audience: ref.video(SEED.video),
+      thread: ref.video(SEED.video),
+      content: "New video on Friday.",
+    },
   });
   assert.equal(posted.execution.state, "completed", JSON.stringify(posted.error));
   const mine = String(((posted.execution.output as Json)["publication"] as Json)["ref"]);
   const mineId = mine.split("/").at(-1)!;
+  assert.equal(mine, ref.comment(SEED.video, mineId));
   assert.equal(api.comments.get(mineId)!["snippet"]["textOriginal"], "New video on Friday.");
 
   const reply = await runtime.execute({
@@ -277,7 +290,7 @@ test("comments, replies, edits and moderation", async () => {
     actor: AGENT,
     input: {
       audience: ref.video(SEED.video),
-      thread: ref.comment(SEED.comment),
+      thread: ref.comment(SEED.video, SEED.comment),
       content: "Thank you!",
     },
   });
@@ -295,28 +308,31 @@ test("comments, replies, edits and moderation", async () => {
   assert.equal(edited.execution.state, "completed", JSON.stringify(edited.error));
   assert.equal(api.comments.get(mineId)!["snippet"]["textOriginal"], "New video on Saturday.");
 
+  const replies = await runtime.execute({
+    capability: "resource.search",
+    actor: AGENT,
+    input: { type: "comment", filters: { parent: ref.comment(SEED.video, SEED.comment) } },
+  });
+  assert.equal(replies.execution.state, "completed", JSON.stringify(replies.error));
+  assert.deepEqual((replies.execution.output as Json)["items"], [
+    { ref: ref.comment(SEED.video, replyId), type: "comment", snippet: "Thank you!" },
+  ]);
+
   const rejected = await runtime.execute({
     capability: "resource.update",
     actor: AGENT,
     input: {
-      resource: ref.comment(SEED.comment),
-      patch: { moderation_status: "rejected", ban_author: true },
+      resource: ref.comment(SEED.video, SEED.comment),
+      patch: { moderation_status: "rejected" },
     },
+    evidence: ["execution", "state"],
   });
   assert.equal(rejected.execution.state, "completed", JSON.stringify(rejected.error));
   const moderation = api.calls.find((c) => c.url.pathname.endsWith("/setModerationStatus"))!;
   assert.equal(moderation.url.searchParams.get("moderationStatus"), "rejected");
-  assert.equal(moderation.url.searchParams.get("banAuthor"), "true");
-
-  const replies = await runtime.execute({
-    capability: "resource.search",
-    actor: AGENT,
-    input: { type: "comment", filters: { parent: ref.comment(SEED.comment) } },
-  });
-  assert.equal(replies.execution.state, "completed", JSON.stringify(replies.error));
-  assert.deepEqual((replies.execution.output as Json)["items"], [
-    { ref: ref.comment(replyId), type: "comment", snippet: "Thank you!" },
-  ]);
+  assert.equal(moderation.url.searchParams.has("banAuthor"), false);
+  const proof = await runtime.listEvidence(rejected.execution.execution_id);
+  assert.deepEqual(proof.at(-1)!.data, { public: false, awaiting_review: false });
 
   const banned = await runtime.execute({
     capability: "resource.update",
@@ -324,7 +340,7 @@ test("comments, replies, edits and moderation", async () => {
     input: { resource: mine, patch: { ban_author: true } },
   });
   assert.equal(banned.execution.state, "failed");
-  assert.match(String(banned.error?.message), /ban_author/);
+  assert.match(String(banned.error?.message), /ban_author is not an editable field/);
 });
 
 test("video metadata is patched against the version that was read", async () => {
@@ -389,7 +405,9 @@ test("video metadata is patched against the version that was read", async () => 
 });
 
 test("thumbnails are fetched over https and set from their bytes", async () => {
-  const { api, runtime } = setup({ provider: { openAttachment: undefined } });
+  const { api, runtime } = setup({
+    provider: { openAttachment: undefined, attachmentHosts: ["media.example.com"] },
+  });
   const outcome = await runtime.execute({
     capability: "resource.update",
     actor: AGENT,
@@ -418,7 +436,32 @@ test("thumbnails are fetched over https and set from their bytes", async () => {
     },
   });
   assert.equal(local.execution.state, "failed");
-  assert.match(String(local.error?.message), /only https/);
+  assert.match(String(local.error?.message), /https only/);
+
+  const thumbnail = (uri: string) =>
+    runtime.execute({
+      capability: "resource.update",
+      actor: AGENT,
+      input: { resource: ref.thumbnail(SEED.video), content: { uri, media_type: "image/png" } },
+    });
+  const moved = await thumbnail("https://media.example.com/moved.png");
+  assert.equal(moved.execution.state, "completed", JSON.stringify(moved.error));
+  const downgraded = await thumbnail("https://media.example.com/to-http.png");
+  assert.match(String(downgraded.error?.message), /https only/);
+  const elsewhere = await thumbnail("https://media.example.com/to-elsewhere.png");
+  assert.match(String(elsewhere.error?.message), /not downloaded from internal\.example\.net/);
+
+  const closed = setup({ provider: { openAttachment: undefined } });
+  const refused = await closed.runtime.execute({
+    capability: "resource.update",
+    actor: AGENT,
+    input: {
+      resource: ref.thumbnail(SEED.video),
+      content: { uri: "https://media.example.com/thumb.png", media_type: "image/png" },
+    },
+  });
+  assert.match(String(refused.error?.message), /attachmentHosts/);
+  assert.equal(closed.api.media.calls.length, 0);
 });
 
 test("playlists: create, add, reorder, list and remove items", async () => {
@@ -507,7 +550,7 @@ test("search: uploads, text search and comments awaiting review", async () => {
     },
   });
   assert.deepEqual((held.execution.output as Json)["items"], [
-    { ref: ref.comment(SEED.comment), type: "comment", snippet: "Great video!" },
+    { ref: ref.comment(SEED.video, SEED.comment), type: "comment", snippet: "Great video!" },
   ]);
 });
 
@@ -667,7 +710,12 @@ test("lost comment and playlist answers are reconciled without repeating them", 
     capability: "communication.publish",
     profile: "chat",
     actor: AGENT,
-    input: { audience: ref.video(SEED.video), content: "Pinned: links below." },
+    traits: ["threading"],
+    input: {
+      audience: ref.video(SEED.video),
+      thread: ref.video(SEED.video),
+      content: "Pinned: links below.",
+    },
   });
   const playlist = await runtime.execute({
     capability: "resource.create",
@@ -746,7 +794,7 @@ test("a held comment can be published again, and lost moderation answers are rec
     runtime.execute({
       capability: "resource.update",
       actor: AGENT,
-      input: { resource: ref.comment(SEED.comment), patch: { moderation_status } },
+      input: { resource: ref.comment(SEED.video, SEED.comment), patch: { moderation_status } },
       evidence: ["execution", "state"],
     });
   const held = await moderate("held_for_review");
@@ -759,7 +807,7 @@ test("a held comment can be published again, and lost moderation answers are rec
   const unreadable = await runtime.execute({
     capability: "resource.read",
     actor: AGENT,
-    input: { resource: ref.comment(SEED.comment) },
+    input: { resource: ref.comment(SEED.video, SEED.comment) },
   });
   assert.match(String(unreadable.error?.message), /not public/);
 
@@ -768,4 +816,195 @@ test("a held comment can be published again, and lost moderation answers are rec
   assert.equal(api.comments.get(SEED.comment)!["snippet"]["moderationStatus"], "published");
   const evidence = await runtime.listEvidence(published.execution.execution_id);
   assert.equal(evidence.at(-1)!.data!["public"], true);
+});
+
+/** Adds uploads newer than everything else, as other invocations would. */
+function uploadMore(api: ReturnType<typeof youtube>, count: number) {
+  for (let i = 0; i < count; i++) {
+    const id = `newer${String(i).padStart(4, "0")}`;
+    api.videos.set(id, {
+      id,
+      snippet: {
+        channelId: CHANNEL,
+        title: id,
+        description: "",
+        tags: [],
+        publishedAt: new Date().toISOString(),
+      },
+      status: { privacyStatus: "private", uploadStatus: "uploaded" },
+    });
+    api.uploads.unshift(id);
+  }
+}
+
+test("upload reconciliation pages back to the invocation, and never fails what it cannot search", async () => {
+  const lose = (r: FakeRequest): Override | undefined =>
+    r.method === "PUT" && r.headers.get("content-range")?.startsWith(`bytes ${2 * CHUNK}-`)
+      ? { after: { drop: true } }
+      : undefined;
+  let losing = true;
+  const busy = setup({
+    override: (r) => (losing ? lose(r) : undefined),
+    provider: { settleAfterMs: -60_000 },
+  });
+  const lost = await busy.runtime.execute(upload());
+  assert.equal(lost.execution.state, "unknown");
+  const uploaded = busy.api.uploads[0]!;
+  losing = false;
+  uploadMore(busy.api, 60);
+  const found = await busy.runtime.reconcile(lost.execution.execution_id);
+  assert.equal(found.execution.state, "completed", JSON.stringify(found.error));
+  assert.equal(
+    ((found.execution.output as Json)["publication"] as Json)["ref"],
+    ref.video(uploaded),
+  );
+
+  losing = true;
+  const flooded = setup({
+    override: (r) => (losing ? lose(r) : undefined),
+    provider: { settleAfterMs: -60_000 },
+  });
+  const second = await flooded.runtime.execute(upload());
+  losing = false;
+  uploadMore(flooded.api, 1001);
+  const unsearchable = await flooded.runtime.reconcile(second.execution.execution_id);
+  assert.equal(
+    unsearchable.execution.state,
+    "unknown",
+    "too many uploads is inconclusive, not failed",
+  );
+});
+
+test("comments stay within the channel: other channels' videos and comments are refused", async () => {
+  const { api, runtime } = setup();
+  const foreignVideo = ref.video(FOREIGN.video);
+  const posted = await runtime.execute({
+    capability: "communication.publish",
+    profile: "chat",
+    traits: ["threading"],
+    actor: AGENT,
+    input: { audience: foreignVideo, thread: foreignVideo, content: "Hello" },
+  });
+  assert.equal(posted.execution.state, "failed");
+  assert.match(String(posted.error?.message), /belongs to another channel/);
+
+  const smuggled = ref.comment(SEED.video, FOREIGN.comment);
+  const replied = await runtime.execute({
+    capability: "communication.publish",
+    profile: "chat",
+    traits: ["threading"],
+    actor: AGENT,
+    input: { audience: ref.video(SEED.video), thread: smuggled, content: "Hello" },
+  });
+  assert.equal(replied.execution.state, "failed");
+  assert.match(String(replied.error?.message), /not on that video/);
+
+  const deleted = await runtime.execute({
+    capability: "resource.delete",
+    actor: AGENT,
+    input: { resource: smuggled },
+  });
+  assert.equal(deleted.execution.state, "failed");
+
+  const missingThread = await runtime.execute({
+    capability: "communication.publish",
+    profile: "chat",
+    actor: AGENT,
+    input: { audience: ref.video(SEED.video), content: "Hello" },
+  });
+  assert.match(String(missingThread.error?.message), /needs a thread/);
+  assert.equal(
+    api.calls.filter((c) => c.method !== "GET").length,
+    0,
+    "nothing was written anywhere",
+  );
+  assert.equal(api.comments.size, 2);
+});
+
+test("a credential for another channel is refused, and reconciliation will not search with it", async () => {
+  const fake = { mine: "UCsomeoneelse" as string | undefined };
+  const api = youtube(fake);
+  const provider = createYouTubeProvider({ channel: CHANNEL, fetch: api.fetch });
+  const { runtime } = runtimeFor(provider, CAPABILITIES, KEY);
+  const refused = await runtime.execute({
+    capability: "resource.read",
+    actor: AGENT,
+    input: { resource: CHANNEL_REF },
+  });
+  assert.equal(refused.execution.state, "failed");
+  assert.equal(refused.error?.code, "credential_unavailable");
+  assert.match(String(refused.error?.message), /does not manage the configured channel/);
+
+  const settled = createYouTubeProvider({
+    channel: CHANNEL,
+    settleAfterMs: -60_000,
+    fetch: api.fetch,
+  });
+  const reconciliation = await settled.reconcile!(
+    {
+      protocol: "runtime/0.1",
+      invocation_id: "inv_mismatch",
+      execution_id: "exec_mismatch",
+      request_id: "req_mismatch",
+      capability: { id: "resource.delete", version: "0.1.0" },
+      traits: [],
+      input: { resource: ref.video(SEED.video) },
+      idempotency_key: "mismatch",
+      deadline: new Date().toISOString(),
+      actor: { ref: AGENT, type: "agent" },
+      evidence: { require: ["execution"] },
+    } as Invocation,
+    {
+      signal: new AbortController().signal,
+      now: () => new Date(),
+      credential: async () => KEY.value,
+    },
+  );
+  assert.equal(reconciliation.status, "inconclusive");
+});
+
+test("moderation is proven from YouTube's lists, not inferred from visibility", async () => {
+  let failing = true;
+  const { api, runtime } = setup({
+    override: (r) =>
+      failing && r.url.pathname.endsWith("/setModerationStatus")
+        ? { before: { status: 502, body: {} } }
+        : undefined,
+    provider: { settleAfterMs: -60_000 },
+  });
+  api.comments.get(SEED.comment)!["snippet"]["moderationStatus"] = "heldForReview";
+  const reject = () =>
+    runtime.execute({
+      capability: "resource.update",
+      actor: AGENT,
+      input: {
+        resource: ref.comment(SEED.video, SEED.comment),
+        patch: { moderation_status: "rejected" },
+      },
+      evidence: ["execution", "state"],
+    });
+  const lost = await reject();
+  assert.equal(lost.execution.state, "unknown");
+  const still = await runtime.reconcile(lost.execution.execution_id);
+  assert.equal(still.execution.state, "failed", "a comment still held is not rejected");
+  assert.equal(still.error?.detail, "reconciled_not_applied");
+
+  failing = false;
+  const done = await reject();
+  assert.equal(done.execution.state, "completed", JSON.stringify(done.error));
+  assert.equal(api.comments.get(SEED.comment)!["snippet"]["moderationStatus"], "rejected");
+});
+
+test("an upload interrupted before its final chunk fails as retryable, with nothing published", async () => {
+  const { api, runtime } = setup({
+    override: (r) =>
+      r.method === "PUT" && r.headers.get("content-range")?.startsWith("bytes 0-")
+        ? { before: { status: 502, body: {} } }
+        : undefined,
+  });
+  const outcome = await runtime.execute(upload());
+  assert.equal(outcome.execution.state, "failed");
+  assert.equal(outcome.error?.code, "execution_failed");
+  assert.equal(outcome.error?.retryable, true);
+  assert.equal(api.uploads.length, 1);
 });

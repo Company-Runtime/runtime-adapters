@@ -14,6 +14,7 @@ import {
   type Deps,
   type Outcome,
 } from "./shared.ts";
+import { load } from "./resources.ts";
 import { markerOf, uploadVideo } from "./upload.ts";
 import { applyPatch, checkUploadData, commentState, VIDEO_FIELDS, videoState } from "./views.ts";
 
@@ -133,18 +134,24 @@ const reconcileUpload = (input: Json, ctx: HandlerContext, deps: Deps): Promise<
     const uploads = channel?.["contentDetails"]?.["relatedPlaylists"]?.["uploads"];
     if (typeof uploads !== "string")
       return { status: "inconclusive", reason: "the uploads of the channel could not be read" };
-    const { body } = await deps.client.call<{ items?: any[] }>(ctx, {
-      path: "/youtube/v3/playlistItems",
-      query: { part: "contentDetails", playlistId: uploads, maxResults: 50 },
-    });
-    const ids = (body?.items ?? [])
-      .map((i) => i?.contentDetails?.videoId)
-      .filter((id) => typeof id === "string");
+    // Uploads are listed newest first: read back until they predate the invocation.
+    const items = await fetchAll(
+      ctx,
+      deps,
+      "/youtube/v3/playlistItems",
+      { part: "snippet,contentDetails", playlistId: uploads },
+      { enough: (all) => !after(all.at(-1)?.["snippet"]?.["publishedAt"], ctx) },
+    );
+    if (!items) return { status: "inconclusive", reason: "too many recent uploads to search" };
+    const ids = items
+      .filter((i) => after(i["snippet"]?.["publishedAt"], ctx))
+      .map((i) => i["contentDetails"]?.["videoId"])
+      .filter((id): id is string => typeof id === "string");
     let video: Record<string, any> | undefined;
-    if (ids.length > 0) {
+    for (let at = 0; at < ids.length && !video; at += 50) {
       const { body: videos } = await deps.client.call<{ items?: any[] }>(ctx, {
         path: "/youtube/v3/videos",
-        query: { part: "snippet,status", id: ids.join(",") },
+        query: { part: "snippet,status", id: ids.slice(at, at + 50).join(",") },
       });
       video = (videos?.items ?? []).find((v) => (v?.snippet?.tags ?? []).includes(marker));
     }
@@ -184,6 +191,10 @@ interface CommentPlan {
   text: string;
 }
 
+/**
+ * A comment is a message in a thread: the video's (`thread` is the video) or a top-level
+ * comment's (`thread` is that comment, a reply). The audience is the video either way.
+ */
 function planComment(input: Json, deps: Deps): CommentPlan {
   const video = resolve(deps.channel, input["audience"], ["video"], "the audience of a comment");
   refuseMembers(input, ["title"], "has no place in a YouTube comment");
@@ -196,18 +207,38 @@ function planComment(input: Json, deps: Deps): CommentPlan {
   const text = input["content"];
   if (!(typeof text === "string" && text.length > 0 && text.length <= 10_000))
     throw new ProviderFailure("a YouTube comment is 1–10000 characters of content");
-  if (input["thread"] === undefined) return { video: video.id, text };
-  const parent = resolve(deps.channel, input["thread"], ["comment"], "the thread");
-  if (parent.id.includes("."))
+  if (input["thread"] === undefined)
+    throw new ProviderFailure(
+      "a YouTube comment needs a thread: the video to comment on, or the comment to reply to",
+    );
+  const thread = resolve(deps.channel, input["thread"], ["video", "comment"], "the thread");
+  if (thread.kind === "video") {
+    if (thread.id !== video.id)
+      throw new ProviderFailure("the thread of a comment is the video it is posted on");
+    return { video: video.id, text };
+  }
+  if (thread.video !== video.id)
+    throw new ProviderFailure("the comment replied to is not on the audience video");
+  if (thread.id.includes("."))
     throw new ProviderFailure("YouTube replies go to top-level comments");
-  return { video: video.id, parent: parent.id, text };
+  return { video: video.id, parent: thread.id, text };
 }
 
-const commentRef = (deps: Deps, id: string) =>
-  refOf({ kind: "comment", channel: deps.channel, id });
+const commentRef = (deps: Deps, video: string, id: string) =>
+  refOf({ kind: "comment", channel: deps.channel, video, id });
 
 async function comment(input: Json, ctx: HandlerContext, deps: Deps) {
   const plan = planComment(input, deps);
+  // YouTube lets anyone comment anywhere: post only where the channel owns the video, and
+  // reply only to a comment that is on it.
+  if (plan.parent)
+    await load(ctx, deps, {
+      kind: "comment",
+      channel: deps.channel,
+      video: plan.video,
+      id: plan.parent,
+    });
+  else await load(ctx, deps, { kind: "video", channel: deps.channel, id: plan.video }, "snippet");
   let posted: Record<string, any>;
   if (plan.parent) {
     ({ body: posted } = await deps.client.call(ctx, {
@@ -227,7 +258,7 @@ async function comment(input: Json, ctx: HandlerContext, deps: Deps) {
   }
   if (typeof posted?.["id"] !== "string")
     throw new Error("YouTube posted the comment without naming it");
-  const ref = commentRef(deps, posted["id"]);
+  const ref = commentRef(deps, plan.video, posted["id"]);
   const at = posted["snippet"]?.["publishedAt"];
   return {
     output: published(ctx, ref, at),
@@ -275,14 +306,16 @@ const reconcileComment = (input: Json, ctx: HandlerContext, deps: Deps): Promise
       return { status: "inconclusive", reason: "several identical comments match" };
     if (matches.length === 1) {
       const found = matches[0]!;
-      const ref = commentRef(deps, found["id"]);
+      const ref = commentRef(deps, plan.video, found["id"]);
       return {
         status: "completed",
         output: published(ctx, ref, found["snippet"]?.["publishedAt"]),
         evidence: [observe(ctx, ["execution", "state"], ref, "comment", commentState(found))],
       };
     }
-    const where = plan.parent ? commentRef(deps, plan.parent) : videoRef(deps, plan.video);
+    const where = plan.parent
+      ? commentRef(deps, plan.video, plan.parent)
+      : videoRef(deps, plan.video);
     return notVisible(ctx, deps, "the comment is not on YouTube", () => [
       observe(ctx, ["state"], where, plan.parent ? "comment" : "video", {
         searched: comments.length,

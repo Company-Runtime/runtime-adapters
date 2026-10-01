@@ -20,31 +20,54 @@ export type OpenAttachment = (uri: string, signal: AbortSignal) => Promise<Attac
 export const markerOf = (key: string) =>
   `${MARKER_PREFIX}${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
 
+const MAX_REDIRECTS = 5;
+
 /**
- * Opens `https:` attachments with a plain GET (no YouTube credential is sent). Other
- * schemes are refused: hosts that keep files elsewhere, or that take URIs from untrusted
- * callers, pass their own `openAttachment`.
+ * Opens attachments with a plain GET (no YouTube credential is sent), only from the given
+ * hosts and only over `https:`. Redirects are followed by hand so that every hop is held
+ * to the same rules. With no hosts, every attachment is refused: hosts that keep files
+ * elsewhere pass their own `openAttachment`.
  */
-export function httpsAttachments(fetcher: typeof fetch = fetch): OpenAttachment {
-  return async (uri, signal) => {
-    const url = new URL(uri);
-    if (url.protocol !== "https:")
-      throw new ProviderFailure("only https attachments can be fetched by the YouTube adapter");
-    let response: Response;
-    try {
-      response = await fetcher(url, { signal });
-    } catch {
-      throw new ProviderFailure("the attachment could not be fetched", {
-        code: "provider_unavailable",
-        retryable: true,
-      });
-    }
-    const length = Number(response.headers.get("content-length"));
-    if (!response.ok || !response.body || !Number.isSafeInteger(length) || length <= 0)
+export function httpsAttachments(
+  hosts: readonly string[],
+  fetcher: typeof fetch = fetch,
+): OpenAttachment {
+  const allowed = new Set(hosts.map((h) => h.toLowerCase()));
+  const check = (url: URL) => {
+    if (allowed.size === 0)
       throw new ProviderFailure(
-        `the attachment could not be fetched (HTTP ${response.status}, a known length is required)`,
+        "attachments are not downloaded: set attachmentHosts or openAttachment on the YouTube adapter",
       );
-    return { size: length, body: response.body };
+    if (url.protocol !== "https:")
+      throw new ProviderFailure("attachments are downloaded over https only");
+    if (!allowed.has(url.hostname.toLowerCase()))
+      throw new ProviderFailure(`attachments are not downloaded from ${url.hostname}`);
+  };
+  return async (uri, signal) => {
+    let url = new URL(uri);
+    for (let hop = 0; ; hop++) {
+      check(url);
+      let response: Response;
+      try {
+        response = await fetcher(url, { signal, redirect: "manual" });
+      } catch {
+        throw new ProviderFailure("the attachment could not be fetched", { retryable: true });
+      }
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        await response.body?.cancel();
+        if (!location || hop >= MAX_REDIRECTS)
+          throw new ProviderFailure("the attachment redirects too often or nowhere");
+        url = new URL(location, url);
+        continue;
+      }
+      const length = Number(response.headers.get("content-length"));
+      if (!response.ok || !response.body || !Number.isSafeInteger(length) || length <= 0)
+        throw new ProviderFailure(
+          `the attachment could not be fetched (HTTP ${response.status}, a known length is required)`,
+        );
+      return { size: length, body: response.body };
+    }
   };
 }
 
@@ -103,13 +126,11 @@ export async function uploadVideo(
       return await step();
     } catch (error) {
       if (ctx.signal.aborted || error instanceof ProviderFailure) throw error;
-      // Nothing can exist yet: unreachable, a 5xx or a lost answer is still no effect.
-      throw new ProviderFailure(
-        error instanceof ProviderUnreachableError
-          ? error.message
-          : "the upload to YouTube was interrupted before it completed",
-        { code: "provider_unavailable", retryable: true },
-      );
+      // Nothing can exist yet: a 5xx or a lost answer is still no effect.
+      if (error instanceof ProviderUnreachableError) throw error;
+      throw new ProviderFailure("the upload to YouTube was interrupted before it completed", {
+        retryable: true,
+      });
     }
   };
 
@@ -179,10 +200,7 @@ export async function uploadVideo(
           throw error;
         const held = received((await probe()).headers);
         if (held < start)
-          throw new ProviderFailure("YouTube lost part of the upload", {
-            code: "provider_unavailable",
-            retryable: true,
-          });
+          throw new ProviderFailure("YouTube lost part of the upload", { retryable: true });
         if (held >= start + chunk.length) return;
         at = held;
       }
