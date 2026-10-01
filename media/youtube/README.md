@@ -8,7 +8,10 @@ Implements YouTube creator work with core capabilities: uploads and comments thr
 ```ts
 import { createYouTubeProvider } from "@runtime-protocol/adapter-youtube";
 
-const provider = createYouTubeProvider({ channel: "UCxxxxxxxxxxxxxxxxxxxxxx" });
+const provider = createYouTubeProvider({
+  channel: "UCxxxxxxxxxxxxxxxxxxxxxx",
+  attachmentHosts: ["files.example.com"],
+});
 
 await runtime.execute({
   capability: "communication.publish",
@@ -39,7 +42,10 @@ await runtime.execute({
 
 - **Options.**
   - `channel` (required): the `UC…` id of the channel the credential manages.
-  - `openAttachment(uri, signal)`: how attachment URIs are opened (see Attachments).
+  - `attachmentHosts`: hosts the default opener may download attachments from (see
+    Attachments). Without it, and without `openAttachment`, nothing is downloaded.
+  - `openAttachment(uri, signal)`: how attachment URIs are opened, instead of the
+    default opener.
   - `chunkSize`: upload chunk size, a multiple of 256 KiB (default 8 MiB).
   - `defaultPrivacy`: privacy of uploads and playlists that set none (default
     `private`).
@@ -49,9 +55,12 @@ await runtime.execute({
   - `id`, `baseUrl`, `tokenUrl`, `credentials` and `fetch`, as in the other adapters.
 - **References.** Everything lives under the configured channel:
   `resource://youtube/<channel>`, `…/videos/<id>`, `…/videos/<id>/thumbnail`,
-  `…/playlists/<id>`, `…/playlists/<id>/items/<id>` and `…/comments/<id>`. References
-  to other channels, and videos or playlists that belong to one, are refused before
-  anything is changed.
+  `…/videos/<id>/comments/<id>`, `…/playlists/<id>` and `…/playlists/<id>/items/<id>`.
+  - References to other channels are refused before any call.
+  - A reference only names a resource, so ownership is read before anything is done:
+    videos, playlists and items must belong to the channel.
+  - A comment must be on a video of the channel, in a thread on that video.
+  - Videos added to a playlist are the one exception: they may come from any channel.
 - **Uploads.** `communication.publish` with the `broadcast` profile, the channel as
   `audience` and exactly one `video/*` attachment. `title` and `content` are the title
   and description. `data` holds `tags`, `category_id` (default `22`), `privacy_status`
@@ -62,13 +71,22 @@ await runtime.execute({
   - The final chunk is sent only once the file matches its declared `size` and `digest`.
   - An upload must finish within the invocation, so set `timeout_ms`; the protocol
     allows at most one hour.
-- **Attachments.** By default the adapter downloads `https:` URIs with a plain GET and
-  refuses every other scheme. It never sends the YouTube credential to that host. If
-  your files live elsewhere, or callers may pass untrusted URIs, pass
-  `openAttachment(uri, signal)` and enforce your own allowlist there.
-- **Comments.** `communication.publish` with the `chat` profile and a video as
-  `audience`. With `thread` (a top-level comment, and the `threading` trait) it posts a
-  reply. Content is plain text.
+- **Attachments.** Uploads and thumbnails take an attachment URI.
+  - By default the adapter downloads it with a plain GET, and only over `https:` from
+    the hosts in `attachmentHosts`. Redirects are followed by hand, at most five, and
+    every hop is held to the same rules. With no hosts, nothing is downloaded.
+  - The YouTube credential is never sent to those hosts.
+  - For files kept elsewhere (a store, a local disk), pass `openAttachment(uri, signal)`.
+- **Network.** The adapter contacts `www.googleapis.com`, `oauth2.googleapis.com` (only
+  for OAuth grants) and the `attachmentHosts`; declare those as egress.
+- **Comments.** A comment is a message in a thread: `communication.publish` with the
+  `chat` profile and the `threading` trait, the video as `audience`, and as `thread`:
+  - the video itself, for a top-level comment;
+  - a top-level comment on that video, for a reply.
+
+  Content is plain text. The video's owner is read before posting, and a reply's parent
+  must be on that video.
+
 - **Updates.**
   - Videos and playlists take a merge `patch` or a full `content` replacement:
     - video fields are the upload `data` fields plus `title` and `description`;
@@ -76,8 +94,8 @@ await runtime.execute({
       `privacy_status`.
   - Playlist items take `{ position }`.
   - Comments take `text` (your own comments) and `moderation_status` (`published`,
-    `held_for_review`, `rejected`, with `ban_author` when rejecting). A string
-    `content` replaces the text.
+    `held_for_review` or `rejected`). A string `content` replaces the text. Banning a
+    comment's author is not supported: it is an action whose result cannot be read.
   - A thumbnail is replaced with `content: { uri, media_type }` (`image/jpeg` or
     `image/png`, at most 2 MB).
 - **Moderation.**
@@ -85,11 +103,16 @@ await runtime.execute({
     rejected comment by id. Reading one fails with "not public".
   - Held comments are found with `resource.search` (`type: "comment"`,
     `filters: { video, moderation_status: "held_for_review" }`).
-  - Moderation is sent without reading the comment first, unless `expected_version`
-    is given; that needs the comment to be readable, so only public comments qualify.
-  - What the adapter can observe, and reconcile on, is whether the comment is public.
-    `published` means public; `held_for_review` and `rejected` mean hidden.
-  - `ban_author` cannot be observed at all.
+  - Moderation checks that the video is the channel's, since YouTube lets only its
+    owner moderate. It reads the comment first only for `expected_version`, which
+    therefore needs a public comment.
+  - Moderation is observed, and reconciled, from what YouTube lists for the video:
+    - `published` is proven by the comment being readable;
+    - `held_for_review` by it being in the held list;
+    - `rejected` by it being neither readable nor in the held or likely-spam lists.
+  - Replies are not listed by moderation status, so their moderation stays unobserved.
+  - Comments that are not public cannot be read, edited or deleted through the adapter;
+    reject them instead.
 - **Versions.** `version` is a digest of a resource's editable state. `expected_version`
   is checked before writing, but YouTube has no conditional writes, so a change made
   between that check and the write can still be overwritten.
@@ -105,10 +128,13 @@ await runtime.execute({
     `held_for_review` or `likely_spam`.
 - **Credentials.** Either an access token, or a JSON OAuth grant
   `{"client_id","client_secret","refresh_token"}`. A grant is exchanged at `tokenUrl`
-  once per invocation and never kept. The credential must belong to the configured
-  channel, with the `youtube.upload` and `youtube.force-ssl` scopes: comments are
-  reconciled by their author, so they must be posted as the configured channel.
-  Accepted owners: `organization`, `workload`, `user`.
+  once per invocation and never kept. It needs the `youtube.upload` and
+  `youtube.force-ssl` scopes. Accepted owners: `organization`, `workload`, `user`.
+  - It must manage the configured channel. Once per invocation the adapter reads the
+    credential's channel (`channels.list?mine=true`, one quota unit) and refuses any
+    other with `credential_unavailable`.
+  - Otherwise effects would land on another channel while references and
+    reconciliation name this one.
 - **Getting a credential.** No billing account or Cloud trial is needed.
   1. Create a Google Cloud project and enable **YouTube Data API v3**.
   2. In **Google Auth Platform**, set the audience to _External_ and keep it in
@@ -139,8 +165,11 @@ await runtime.execute({
   - Comments are matched by author, text and time.
   - New playlists are matched by title, description and time; new items by video and
     time. When more than one candidate matches, the outcome stays inconclusive.
+  - Uploads are searched back to the earliest moment the invocation could have run.
+    When there are too many recent uploads to read, the outcome stays inconclusive and
+    is never reported as failed.
   - Updates and deletions are reconciled by reading the resource. Tags are compared
-    as sets, and moderation by whether the comment is public.
+    as sets, and moderation as described under Moderation.
   - A thumbnail's source image cannot be read back, so an uncertain thumbnail update
     stays unknown.
   - Absence becomes a proven failure only `settleAfterMs` after the deadline
@@ -150,9 +179,10 @@ await runtime.execute({
     retryable `provider_unavailable`.
   - 401 is `credential_unavailable`.
   - Other refusals are `execution_failed`.
-  - 5xx answers and interruptions after sending are `unknown`, except during an upload
-    before its final chunk: no video exists yet, so those fail with a retryable
-    `provider_unavailable`.
+  - 5xx answers and interruptions after sending are `unknown`, with one exception. An
+    upload interrupted before its final chunk has created nothing, since YouTube makes
+    no video until the last byte arrives. It fails with a retryable `execution_failed`.
+    The same goes for an OAuth exchange that went wrong.
 - **Quota.** Most calls cost one unit. Text search (`search.list`) costs 100, and an
   upload costs far more, so prefer listing over searching.
 - **Propagation.** Seen on a real channel:
