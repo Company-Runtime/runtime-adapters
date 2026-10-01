@@ -89,6 +89,18 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
+  media/youtube:
+    devDependencies:
+      '@runtime-protocol/sdk':
+        specifier: github:Company-Runtime/runtime-sdk#ed349679bc0b80a5d97c2b967c18a56958fff7f6
+        version: https://codeload.github.com/Company-Runtime/runtime-sdk/tar.gz/ed349679bc0b80a5d97c2b967c18a56958fff7f6
+      '@types/node':
+        specifier: ^22.20.4
+        version: 22.20.4
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
 packages:
 
   '@runtime-protocol/sdk@https://codeload.github.com/Company-Runtime/runtime-sdk/tar.gz/ed349679bc0b80a5d97c2b967c18a56958fff7f6':

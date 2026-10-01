@@ -2,6 +2,7 @@ packages:
   - "ai/*"
   - "communication/*"
   - "engineering/*"
+  - "media/*"
 
 onlyBuiltDependencies:
   - "@runtime-protocol/sdk"
